@@ -11,6 +11,7 @@ extern "C" {
 #include <stdbool.h>
 #include <stdint.h>
 #include "epd_internals.h"
+#include "epd_board.h"
 
 /** Display software rotation.
  *  Sets the rotation for the purposes of the drawing and font functions
@@ -187,6 +188,9 @@ typedef struct {
 
 /** Initialize the ePaper display */
 void epd_init(enum EpdInitOptions options);
+
+/** Set the board hardware definition. This must be called before epd_init() */
+void epd_set_board(const EpdBoardDefinition *board);
 
 /** Get the display rotation value */
 enum EpdRotation epd_get_rotation();
@@ -387,6 +391,18 @@ void epd_get_text_bounds(const EpdFont *font, const char *string,
                      const int *x, const int *y,
                      int *x1, int *y1, int *w, int *h,
                      const EpdFontProperties *props);
+/*!
+ * Returns a rect with the bounds of the text
+ * @param font : the font used to get the character sizes
+ * @param string: pointer to c string
+ * @param x : left most position of rectangle
+ * @param y : top most point of the rectangle
+ * @param margin : to be pllied to the width and height
+ * @returns EpdRect with x and y as per the original and height and width
+ *       adjusted to fit the text with the margin added as well.
+ */
+EpdRect epd_get_string_rect (const EpdFont *font, const char *string,
+                     int x, int y, int margin, const EpdFontProperties *properties );
 
 /**
  * Write text to the EPD.
