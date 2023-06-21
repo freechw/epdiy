@@ -1,15 +1,25 @@
 #include "i2s_data_bus.h"
-#include "driver/periph_ctrl.h"
+
 #include "driver/rtc_io.h"
+#include "esp_system.h"
 #if ESP_IDF_VERSION < (4, 0, 0) || ARDUINO_ARCH_ESP32
 #include "rom/lldesc.h"
+#include "rom/gpio.h"
 #else
 #include "esp32/rom/lldesc.h"
+#include "esp32/rom/gpio.h"
 #endif
 #include "esp_heap_caps.h"
 #include "soc/i2s_reg.h"
 #include "soc/i2s_struct.h"
 #include "soc/rtc.h"
+
+#include "esp_system.h"  // for ESP_IDF_VERSION_VAL
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+#include "esp_private/periph_ctrl.h"
+#else
+#include "driver/periph_ctrl.h"
+#endif
 
 /// DMA descriptors for front and back line buffer.
 /// We use two buffers, so one can be filled while the other
@@ -39,9 +49,10 @@ static gpio_num_t start_pulse_pin;
 
 /// Initializes a DMA descriptor.
 static void fill_dma_desc(volatile lldesc_t *dmadesc, uint8_t *buf,
-                          uint32_t epd_row_width) {
-  dmadesc->size = epd_row_width / 4;
-  dmadesc->length = epd_row_width / 4;
+                          uint32_t buf_size, uint32_t buf_length) {
+  assert(buf_length % 4 == 0);  // Must be word aligned
+  dmadesc->size = buf_size;
+  dmadesc->length = buf_length;
   dmadesc->buf = buf;
   dmadesc->eof = 1;
   dmadesc->sosf = 1;
@@ -57,6 +68,13 @@ uint32_t dma_desc_addr() {
                                    : i2s_state.dma_desc_b) &
          0x000FFFFF;
 }
+
+// Helper function to help align values
+static size_t align_up(size_t x, size_t a)
+{
+    return (size_t)(x + ((size_t)a - 1)) & ~(size_t)(a-1);
+}
+
 
 /// Set up a GPIO as output and route it to a signal.
 static void gpio_setup_out(int gpio, int sig, bool invert) {
@@ -80,7 +98,7 @@ static void IRAM_ATTR i2s_int_hdl(void *arg) {
 }
 
 volatile uint8_t IRAM_ATTR *i2s_get_current_buffer() {
-  return current_buffer ? i2s_state.dma_desc_a->buf : i2s_state.dma_desc_b->buf;
+  return (volatile uint8_t*) (current_buffer ? i2s_state.dma_desc_a->buf : i2s_state.dma_desc_b->buf);
 }
 
 bool IRAM_ATTR i2s_is_busy() {
@@ -151,7 +169,11 @@ void i2s_gpio_detach(i2s_bus_config *cfg) {
   gpio_set_direction(cfg->clock, GPIO_MODE_INPUT);
 
   gpio_reset_pin(cfg->clock);
-  rtc_gpio_isolate(cfg->clock);
+  if (cfg->clock != 5) {
+    rtc_gpio_isolate(cfg->clock);
+  }
+  // https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/peripherals/gpio.html#_CPPv416rtc_gpio_isolate10gpio_num_t
+  rtc_gpio_isolate(GPIO_NUM_12);
 }
 
 void i2s_bus_init(i2s_bus_config *cfg, uint32_t epd_row_width) {
@@ -191,11 +213,11 @@ void i2s_bus_init(i2s_bus_config *cfg, uint32_t epd_row_width) {
   // (Smallest possible divider according to the spec).
   dev->sample_rate_conf.tx_bck_div_num = 2;
 
-#if defined(CONFIG_EPD_DISPLAY_TYPE_ED097OC4_LQ)
-  // Initialize Audio Clock (APLL) for 120 Mhz.
-  rtc_clk_apll_enable(1, 0, 0, 8, 0);
+  // Initialize Audio Clock (APLL)
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+  rtc_clk_apll_enable(true);
+  rtc_clk_apll_coeff_set(0, 0, 0, 8);
 #else
-  // Initialize Audio Clock (APLL) for 100 Mhz.
   rtc_clk_apll_enable(1, 0, 0, 8, 0);
 #endif
 
@@ -227,14 +249,15 @@ void i2s_bus_init(i2s_bus_config *cfg, uint32_t epd_row_width) {
   dev->timing.val = 0;
 
   // Allocate DMA descriptors
-  i2s_state.buf_a = heap_caps_malloc(epd_row_width / 4, MALLOC_CAP_DMA);
-  i2s_state.buf_b = heap_caps_malloc(epd_row_width / 4, MALLOC_CAP_DMA);
+  const size_t buf_size = align_up(epd_row_width/4, 4);  // Buf size must be word aligned
+  i2s_state.buf_a = heap_caps_malloc(buf_size, MALLOC_CAP_DMA);
+  i2s_state.buf_b = heap_caps_malloc(buf_size, MALLOC_CAP_DMA);
   i2s_state.dma_desc_a = heap_caps_malloc(sizeof(lldesc_t), MALLOC_CAP_DMA);
   i2s_state.dma_desc_b = heap_caps_malloc(sizeof(lldesc_t), MALLOC_CAP_DMA);
 
   // and fill them
-  fill_dma_desc(i2s_state.dma_desc_a, i2s_state.buf_a, epd_row_width);
-  fill_dma_desc(i2s_state.dma_desc_b, i2s_state.buf_b, epd_row_width);
+  fill_dma_desc(i2s_state.dma_desc_a, i2s_state.buf_a, epd_row_width/4, buf_size);
+  fill_dma_desc(i2s_state.dma_desc_b, i2s_state.buf_b, epd_row_width/4, buf_size);
 
   // enable "done" interrupt
   SET_PERI_REG_BITS(I2S_INT_ENA_REG(1), I2S_OUT_DONE_INT_ENA_V, 1,
@@ -280,6 +303,12 @@ void i2s_deinit() {
   free((void *)i2s_state.dma_desc_a);
   free((void *)i2s_state.dma_desc_b);
 
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+  rtc_clk_apll_coeff_set(0, 0, 0, 8);
+  rtc_clk_apll_enable(true);
+#else
   rtc_clk_apll_enable(0, 0, 0, 8, 0);
+#endif
+
   periph_module_disable(PERIPH_I2S1_MODULE);
 }
